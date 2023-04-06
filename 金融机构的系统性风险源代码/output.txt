@@ -1,0 +1,1157 @@
+***** call_fct.m *****
+***** call_fct.m *****
+% PURPOSE: Main Script
+%       Run DCC with GJR Garch estimation (Maximum Likelihood in 2 step) and compute:
+%           - MES, Delta CoVaR dcc, Delta CoVaR quantile and Delta CoVaR ols
+% 
+% USERS INPUTS:
+%       index   = A t by 1 vector with index returns
+%       asset   = A t by 1 vector with asset returns
+%       alpha   = A scalar between [0,1], risk level of our VaR   
+%
+% TREATMENT:
+%       data_center     = A zero mean t by 2 matrix of returns, per convention the first column is the market returns and the second is the asset
+%
+% GJR-GARCH and DCC:
+%       dcc_mvgarch: call function to estimate DCC-GJRGARCH (Kevin Sheppard)
+%
+%   USERS OUTPUTS:
+%       res.ht_i            = A t by 1 Asset conditional volatility matrix
+%       res.ht_m            = A t by 1 Market conditional volatility matrix
+%       res.rho             = A t by 1 conditional correlation matrix
+%       res.Asset_VaR       = A t by 1 Asset_VaR matrix with empirical quantile at alpha
+%       res.Market_VaR      = A t by 1 Market_VaR matrix with empirical quantile at alpha
+%       res.beta            = A t by 1 conditional beta matrix
+%       res.loglikelihood   = The log likelihood evaluated at the optimum
+%       res.parameters      = A vector of parameters estimated for our data of the form
+%                          [GarchParams(market) GarchParams(asset) DCCParams]
+%                               where the garch parameters from each estimation are of the form
+%                          [omega(i) alpha(i1) beta(i1))]
+%       res.recap_stderror  = A vector of standard errors for each parameters
+%       res.recap_t_stat    = A vector of T-Statistic for each parameters
+%
+% MES:
+%       fct_MES: call function to estimate MES 
+%       c             = A scalar which is used to define the systemic risk event, Market HS VaR here 
+%                           it's a constant(-2% in MES paper) dividing by market conditional standard deviation
+%   USERS OUTPUTS:
+%       res.MES           = A t by 1 MES matrix
+%
+% SRISK:
+%   USERS OUTPUTS:
+%       SRISK         = A t by 1 SRISK matrix
+%
+% CoVaR:
+%   USERS OUTPUTS:
+%       res.Delta_CoVaR_dcc     = A t by 1 Delta CoVaR dcc matrix
+%       res.CoVaR_quant         = A t by 1 CoVaR quantile matrix
+%       res.Delta_CoVaR_quant   = A t by 1 Delta CoVaR quantile matrix
+%       res.Delta_CoVaR_ols     = A t by 1 Delta CoVaR ols matrix
+%       res.gam_quant           = Slope parameter estimated by Quantile regression
+%       res.gam_ols             = Slope parameter estimated by OLS
+%
+% 更多数据请关注公众号【众鲤数据网】官网https://zldatas.com
+
+
+function [res] = call_fct(index,asset,LTQ,MV,k,alpha)
+
+warning off
+
+%% Data treatment
+
+data = [index asset];
+
+data = data(~isnan(data(:,2).*data(:,1)),:); % select only elements which are not NaN
+
+data_center = data - ones(size(data,1),1)*mean(data); %demeaned returns
+
+%% GJR-GARCH and DCC
+
+[parameters, loglikelihood, Ht, Rt, Qt, stdresid, likelihoods, stderrors, A,B, jointscores, H]=dcc_mvgarch(data_center,1,1,1,1);
+
+ht_m=sqrt(H(:,1)); %market conditional volatility
+
+ht_i=sqrt(H(:,2)); %asset conditional volatility
+
+rho=squeeze(Rt(1,2,:)); %conditional correlation
+
+stderrors2=(stderrors.*eye(size(parameters,1),size(parameters,1)));
+
+recap_stderror=stderrors2(stderrors2~=0);
+
+recap_t_stats(:,1)=parameters./(stderrors2(stderrors2>0));
+
+%Conditional Asset VaR from dcc with Empirical Quantile at alpha
+    Asset_VaR = ht_i*quantile(data_center(:,2)./ht_i,alpha);
+        
+%Conditional Market VaR from dcc with Empirical Quantile at alpha
+    Market_VaR = ht_m*quantile(data_center(:,1)./ht_m,alpha);
+
+%Conditional beta
+    Beta = rho.*ht_i./ht_m;
+
+    
+%% Descriptives Statistics & Graph
+
+%mean, std deviation, Skewness, Kurtosis, Max, Min,
+
+%% Tails NonParametric estimation and MES (expected losses (in %) of the asset return when market return goes down of more than c%); Eq 9
+
+disp(' ')
+disp(' === Third Step : Estimation of the MES ===')
+disp(' ')
+
+%attention au cut!!!
+c = quantile(data_center(:,1),alpha); % HS VaR (nonparametric), it's our systemic event, it's a scalar here
+
+MES = - fct_MES(data_center,c,ht_m,ht_i,rho);
+
+disp(sprintf('   Average MES = %3.4f',mean(MES))), disp(' ')
+
+%% Delta CoVaR DCC when asset return is equal to his VaR; Eq 24
+
+disp(' ')
+disp(' === Fourth Step : SRISK computation ===')
+disp(' ')
+
+    LRMES = (1-exp(-18.*MES)); %without simulation
+    
+disp(sprintf('   Average LRMES = %3.4f',mean(LRMES))), disp(' ')
+
+    SRISK = k.*LTQ - (1-k).*(1-LRMES).*MV;
+
+disp(sprintf('   Average SRISK = %3.4f',mean(SRISK))), disp(' ')
+
+%% Delta CoVaR DCC when asset return is equal to his VaR; Eq 24
+
+disp(' ')
+disp(' === Fifth Step : Estimation of CoVaR and DCoVaR ===')
+disp(' ')
+
+    Delta_CoVaR_dcc = - ( rho.*ht_m./ht_i.*Asset_VaR...
+        - rho.*ht_m./ht_i.*repmat(median(data_center(:,2)),size(data_center,1),1) );
+
+    disp(sprintf('   Average DCoVaR (DCC) = %3.4f',mean(Delta_CoVaR_dcc))), disp(' ')
+
+%% Delta CoVaR Quantile when asset return is equal to his VaR; Eq 23
+
+[beta tstats]=quantilereg(data_center(:,1),data_center(:,2),alpha); %Quant with constant
+
+gam_quant = beta(2);
+
+CoVaR_quant = - ( beta(1) + beta(2).*Asset_VaR );
+
+    Delta_CoVaR_quant = - ( beta(2).*Asset_VaR ...
+        - beta(2).*repmat(median(data_center(:,2)),size(data_center,1),1) );
+
+        disp(sprintf('   Average DCoVaR (quantile regression) = %3.4f',mean(Delta_CoVaR_quant))), disp(' ')
+        
+%% Delta CoVaR OLS when asset return is equal to his VaR; Eq 25
+
+    gam_ols = [data_center(:,2)] \ data_center(:,1); %OLS without constant (r_mt = gam_ols *r_it) cause demeaned returns
+        
+    Delta_CoVaR_ols = - ( gam_ols.*Asset_VaR ...
+        - gam_ols.*repmat(median(data_center(:,2)),size(data_center,1),1) );
+    
+    disp(sprintf('   Average DCoVaR (OLS regression) = %3.4f',mean(Delta_CoVaR_ols))), disp(' ')
+    
+%% Clear and treatments on OTHERS OUTPUTS
+
+clear Ht Rt Qt stdresid likelihoods stderrors A B jointscores H stderrors2 c beta tstats
+
+Market_VaR = - Market_VaR;
+
+Asset_VaR = - Asset_VaR;
+
+%% Affectations 
+res.ht_i=ht_i;
+res.ht_m=ht_m;
+res.rho=rho;
+res.Asset_VaR=Asset_VaR;
+res.Market_VaR=Market_VaR;
+res.Beta=Beta;
+res.loglikelihood=loglikelihood;
+res.parameters=parameters;
+res.recap_stderror=recap_stderror;
+res.recap_t_stats=recap_t_stats;
+res.MES=MES;
+res.LRMES=LRMES;
+res.SRISK=SRISK;
+res.Delta_CoVaR_dcc=Delta_CoVaR_dcc;
+res.CoVaR_quant=CoVaR_quant;
+res.Delta_CoVaR_quant=Delta_CoVaR_quant;
+res.Delta_CoVaR_ols=Delta_CoVaR_ols;
+res.gam_quant=gam_quant;
+res.gam_ols=gam_ols;
+
+
+%% Graphs
+
+x=linspace(1,size(asset,1),size(asset,1))'; %x axis!
+    
+close all
+%Asset Conditional Volatility
+f1=figure;
+
+subplot(3,1,1)
+   plot(ht_i);
+            title('Conditional volatility of the asset returns','FontSize',10,'fontweight','b','color','k');
+            xlabel('','fontsize',8,'fontweight','b','color','k');
+            set(gca,'xlim',[min(x) max(x)],'xtick',linspace(min(x),max(x),4),...
+            'ylim',[0 (max(ht_i)+0.1*max(ht_i))],...
+            'ytick',linspace(0,(max(ht_i)+0.1*max(ht_i)),5));
+
+%Market Conditional Volatility
+subplot(3,1,2)
+    plot(ht_m);
+            title('Conditional volatility of the market returns','FontSize',10,'fontweight','b','color','k');
+            xlabel('','fontsize',8,'fontweight','b','color','k');
+            set(gca,'xlim',[min(x) max(x)],'xtick',linspace(min(x),max(x),4),...
+            'ylim',[0 (max(ht_m)+0.1*max(ht_m))],...
+            'ytick',linspace(0,(max(ht_m)+0.1*max(ht_m)),5));
+            
+%Conditional Correlation
+subplot(3,1,3)
+    plot(rho);
+            title('Correlation market/asset returns','FontSize',10,'fontweight','b','color','k');
+            xlabel('','fontsize',8,'fontweight','b','color','k');
+            set(gca,'xlim',[min(x) max(x)],'xtick',linspace(min(x),max(x),4),...
+            'ylim',[0 (max(rho)+0.1*max(rho))],...
+            'ytick',linspace(0,(max(rho)+0.1*max(rho)),5));
+
+%Asset VaR & Demeaned Returns
+f2=figure; 
+subplot(2,1,1)
+    plot(x,data_center(:,2),'b',x,-Asset_VaR,'r');
+            title('VaR of asset returns','FontSize',10,'fontweight','b','color','k');
+            xlabel('','fontsize',8,'fontweight','b','color','k');
+            ylabel('VaR & Demeaned Returns','fontsize',8,'fontweight','b','color','k');
+            set(gca,'xlim',[min(x) max(x)],'xtick',linspace(min(x),max(x),4),...
+            'ylim',[(min(data_center(:,2))+0.1*min(data_center(:,2))) (max(data_center(:,2))+0.1*max(data_center(:,2)))],...
+            'ytick',linspace((min(data_center(:,2))+0.1*min(data_center(:,2))),(max(data_center(:,2))+0.1*max(data_center(:,2))),5));         
+        legend('Returns','Value-at-Risk','location','northwest')
+
+%Market VaR & Demeaned Returns
+subplot(2,1,2)
+plot(x,data_center(:,1),'b',x,-Market_VaR,'r');
+            title('VaR of market returns','FontSize',10,'fontweight','b','color','k');
+            xlabel('','fontsize',8,'fontweight','b','color','k');
+            ylabel('VaR & Demeaned Returns','fontsize',8,'fontweight','b','color','k');
+            set(gca,'xlim',[min(x) max(x)],'xtick',linspace(min(x),max(x),4),...
+            'ylim',[(min(data_center(:,1))+0.1*min(data_center(:,1))) (max(data_center(:,1))+0.1*max(data_center(:,1)))],...
+            'ytick',linspace((min(data_center(:,1))+0.1*min(data_center(:,1))),(max(data_center(:,1))+0.1*max(data_center(:,1))),5));             
+        legend('Returns','Value-at-Risk','location','northwest')           
+            
+%MES
+f3=figure;
+    plot(x,MES);
+            title('MES','FontSize',10,'fontweight','b','color','k');
+            xlabel('','fontsize',8,'fontweight','b','color','k');
+            ylabel('%','fontsize',8,'fontweight','b','color','k');
+            set(gca,'xlim',[min(x) max(x)],'xtick',linspace(min(x),max(x),4),...
+            'ylim',[0 (max(MES)+0.1*max(MES))],...
+            'ytick',linspace(0,(max(MES)+0.1*max(MES)),5));
+            
+%SRISK
+f4=figure;
+    plot(x,SRISK);
+            title('SRISK','FontSize',10,'fontweight','b','color','k');
+            xlabel('','fontsize',8,'fontweight','b','color','k');
+            ylabel('million','fontsize',8,'fontweight','b','color','k');
+            set(gca,'xlim',[min(x) max(x)],'xtick',linspace(min(x),max(x),4),...
+            'ylim',[0 (max(SRISK)+0.1*max(SRISK))],...
+            'ytick',linspace(0,(max(SRISK)+0.1*max(SRISK)),5));
+        
+%Delta_CoVaR_dcc
+f5=figure;
+subplot(2,1,1)
+    plot(x,Delta_CoVaR_dcc);
+            title('\DeltaCoVaR (DCC)','FontSize',10,'fontweight','b','color','k');
+            xlabel('','fontsize',8,'fontweight','b','color','k');
+            ylabel('%','fontsize',8,'fontweight','b','color','k');           
+            set(gca,'xlim',[min(x) max(x)],'xtick',linspace(min(x),max(x),4),...
+            'ylim',[0 (max(Delta_CoVaR_dcc)+0.1*max(Delta_CoVaR_dcc))],...
+            'ytick',linspace(0,(max(Delta_CoVaR_dcc)+0.1*max(Delta_CoVaR_dcc)),5));
+            
+%Delta_CoVaR_quantile
+subplot(2,1,2)
+    plot(x,Delta_CoVaR_quant);
+            title('\DeltaCoVaR (quantile regression)','FontSize',10,'fontweight','b','color','k');
+            xlabel('','fontsize',8,'fontweight','b','color','k');
+            ylabel('%','fontsize',8,'fontweight','b','color','k');
+            set(gca,'xlim',[min(x) max(x)],'xtick',linspace(min(x),max(x),4),...
+            'ylim',[0 (max(Delta_CoVaR_quant)+0.1*max(Delta_CoVaR_quant))],...
+            'ytick',linspace(0,(max(Delta_CoVaR_quant)+0.1*max(Delta_CoVaR_quant)),5));
+
+        
+%Conditional MES VS Delta_CoVaR_dcc
+f6=figure;         
+        [A,H1A,H2A] = plotyy(x,MES,x,Delta_CoVaR_dcc);
+            title('Comparison MES and \DeltaCoVaR (DCC)','FontSize',10,'fontweight','b','color','k');
+            xlabel('','fontsize',8,'fontweight','b','color','k');
+            set(get(A(1),'Ylabel'),'String','MES','fontsize',8,'fontweight','b','color','b')
+            set(get(A(2),'Ylabel'),'String','DCC-\DeltaCoVaR','fontsize',8,'fontweight','b','color','r')
+            set(A(1),'ylim',[0 (max(MES)+0.1*max(MES))],'ytick',linspace(0,(max(MES)+0.1*max(MES)),5),...
+                'xlim',[min(x) max(x)], 'xtick',linspace(min(x),max(x),4))
+            set(A(2),'ylim',[0 (max(Delta_CoVaR_dcc)+0.1*max(Delta_CoVaR_dcc))],'ytick',linspace(0,(max(Delta_CoVaR_dcc)+0.1*max(Delta_CoVaR_dcc)),5),...
+                'xlim',[min(x) max(x)], 'xtick',[])                    
+            legend('MES','\DeltaCoVaR (DCC)','location','northwest')
+
+***** dcc_hessian.m *****
+***** dcc_hessian.m *****
+% PURPOSE:
+%          Special purpose hessian for use with dcc std errors
+% 
+% USAGE:
+%          H = dcc_hessian(func,x,N,varargin)
+%  
+% INPUTS:
+%          f = function name, feval = func(x,varargin)
+%          x = vector of parameters (n x 1)
+%          N = the last N rows to be completed 
+%          varargin = optional arguments passed to the function
+% 
+% OUTPUTS:
+%          H = the N last rows of the hessian used to speed up dcc_garch
+% 
+% COMMENTS:
+%  
+% Author: Kevin Sheppard
+% kevin.sheppard@economics.ox.ac.uk
+% Revision: 2    Date: 12/31/2001
+% Code modified from:
+% COMPECON toolbox [www4.ncsu.edu/~pfackler]
+% by James P. LeSage, Dept of Economics
+% University of Toledo
+% 2801 W. Bancroft St,
+% Toledo, OH 43606
+% 更多数据请关注公众号【众鲤数据网】官网https://zldatas.com
+
+function H = dcc_hessian(f,x,N,varargin)
+
+n = size(x,1);
+fx = feval(f,x,varargin{:});
+ 
+% Compute the stepsize (h)
+h = eps.^(1/3)*max(abs(x),1);
+xh = x+h;
+h = xh-x;    
+ee = sparse(1:n,1:n,h,n,n);
+ 
+% Compute forward step 
+g = zeros(n,1);
+for i=1:n
+  g(i) = feval(f,x+ee(:,i),varargin{:});
+end
+   
+H=h*h';
+% Compute "double" forward step 
+index=1;
+for i=1:n
+for j=(n-N+1):n
+%    fprintf('Evaluating Function %d out of %d\n',index,n*N);
+  if i<=j;
+      H(i,j) = (feval(f,x+ee(:,i)+ee(:,j),varargin{:})-g(i)-g(j)+fx)/H(i,j);
+      H(j,i) = H(i,j);
+  end
+  index=index+1;
+end
+end
+
+newH=H((n-N+1):n,:);
+H=newH;
+
+***** dcc_mvgarch.m *****
+% PURPOSE:
+%        Estimates a multivariate GARCH model using the DCC estimator of Engle and Sheppard
+% 
+% USAGE:
+%        [parameters, loglikelihood, Ht, Rt, Qt, likelihoods, stdresid, stderrors, A,B, jointscores]...
+%                =dcc_mvgarch(data,dccQ,dccP,archQ,garchP)
+% 
+% INPUTS:
+%      data          = A zero mean t by k (asset number) vector of residuals from some filtration [t by k]
+%      dccQ          = The lag length of the innovation term in the DCC estimator (a scalar)
+%      dccP          = The lag length of the lagged correlation matrices in the DCC estimator (a scalar)
+%      archQ         = One of two things:     A scalar, q     in which case a p innovation model is estimated for each series
+%                                             A k by 1 vector in which case the ith series has innovation terms p=archP(i)
+%      garchP        = One of two things:     A scalar, p     in which case a q GARCH lags is used in estimation for each series
+%                                             A k by 1 vector in which case the ith series has lagged variance terms q=archQ(i)
+%
+% OUTPUTS:
+%      parameters    = A vector of parameters estimated form the model of the form
+%                          [GarchParams(1) GarchParams(2) ... GarchParams(k) DCCParams]
+%                          where the Garch Parameters from each estimation are of the form
+%                          [omega(i) alpha(i1) alpha(i2) ... alpha(ip(i)) beta(i1) beta(i2) ... beta(iq(i))]
+%      loglikelihood = The log likelihood evaluated at the optimum
+%      Ht            = A k by k by t array of conditional variances
+%      Rt            = A k by k by t array of Rt elements
+%      Qt            = A k by k by t array of Qt elements
+%      stdresid      = A [t by k] matrix of standardized residuals
+%      likelihoods   = the estimated likelihoods t by 1
+%      stderrors     = A length(parameters)^2 matrix of estimated correct standard errors
+%      A             = The estimated A from the robust standard errors
+%      B             = The estimated B from the standard errors
+%      jointscores   = The estimated scores of the likelihood t by length(parameters)
+%      H             = Conditional Volatility univariate
+% 
+% COMMENTS:
+%
+% Modifications: Sylvain Benoit    Date Revision: 17/09/2014
+% Initial codes Author: Kevin Sheppard
+% 更多数据请关注公众号【众鲤数据网】官网https://zldatas.com
+
+function [parameters, loglikelihood, Ht, Rt, Qt, stdresid, likelihoods, stderrors, A,B, jointscores, H]=dcc_mvgarch(data,dccQ,dccP,archQ,garchP)
+
+[t,k]=size(data);
+
+if length(archQ)==1
+    archQ=ones(1,k)*archQ;
+end
+
+if length(garchP)==1
+    garchP=ones(1,k)*garchP;
+end
+
+disp(' ')
+disp(' === First Step : Estimation of GJR-GARCH ===')
+
+%% Now lest do the univariate garching using fattailed_GJRgarch
+
+options  =  optimset('fmincon');
+options  =  optimset(options , 'TolFun'      , 1e-006);
+options  =  optimset(options , 'Display'     , 'on');
+options  =  optimset(options , 'Diagnostics' , 'off');
+options  =  optimset(options , 'LargeScale'  , 'off');
+options  =  optimset(options , 'MaxFunEvals' , 1000*max(archQ+garchP+1));
+options  =  optimset(options , 'MaxIter'     , 1000*max(archQ+garchP+1));  
+options  =  optimset(options , 'MaxSQPIter'  , 1000);
+
+for i=1:k
+    disp(' ')
+    fprintf(1,' Estimating GJR-GARCH model for Series %d\n',i)
+    
+    [univariate{i}.parameters, univariate{i}.likelihood, univariate{i}.stderrors, univariate{i}.robustSE, univariate{i}.ht, univariate{i}.scores] ... 
+        = GJRgarch( data(:,i) , archQ(i) , garchP(i) , [], options);
+    
+    stdresid(:,i)=data(:,i)./sqrt(univariate{i}.ht); %calcul des r閟idus standardis閟!
+
+end
+
+
+%% Now lest do the multivariate garching using dcc_mvgarch_likelihood
+
+
+options_base  =  optimset('fmincon');
+options  =  optimset(options_base,'Algorithm','sqp',...
+    'LargeScale', 'off', 'Display', 'on', 'Diagnostics', 'off');
+
+dccstarting=[ones(1,dccQ)*.01/dccQ ones(1,dccP)*.97/dccP];
+
+disp(' ')
+disp(' === Second Step : Estimation of the DCC ===')
+disp(' ')
+
+[dccparameters,dccllf,EXITFLAG,OUTPUT,LAMBDA,GRAD]=fmincon('dcc_mvgarch_likelihood',dccstarting, ones(size(dccstarting)),[1-2*options.TolCon],[],[],...
+    zeros(size(dccstarting))+2*options.TolCon,[],[],options,stdresid,dccQ,dccP);
+
+
+%% We now have all of the estimated parameters
+
+parameters=[];
+H=zeros(t,k);
+for i=1:k
+    parameters=[parameters;univariate{i}.parameters];
+    H(:,i)=univariate{i}.ht;
+end
+parameters=[parameters;dccparameters'];
+
+
+%% We now have Ht and the likelihood but we want the FULL LIKELIHOOD
+
+% options  =  optimset('fminsearch');
+% options  =  optimset(options , 'Display'            , 'iter');
+% options  =  optimset(options , 'Diagnostics'        , 'on');
+% options  =  optimset(options , 'LevenbergMarquardt' , 'on');
+% options  =  optimset(options , 'LargeScale'         , 'off');
+% options  =  optimset(options , 'MaxIter'            , 1);
+% % ?utiliser avec parcimonie car on ne ma顃rise plus les contraintes!
+% [parameters,loglikelihood,exitflag]=fminsearch('dcc_mvgarch_full_likelihood', parameters, options, data, archQ, garchP, dccQ, dccP);
+% [loglikelihood, Rt, likelihoods, Qt]=dcc_mvgarch_full_likelihood(parameters, data, archQ, garchP, dccQ, dccP);
+
+[loglikelihood, Rt, likelihoods, Qt]=dcc_mvgarch_full_likelihood(parameters, data, archQ, garchP, dccQ, dccP);
+
+likelihoods=-likelihoods;                                                   %output;
+loglikelihood=-loglikelihood;                                               %output;
+Ht=zeros(k,k,t);
+Hstd=H.^(0.5);
+for i=1:t
+    Ht(:,:,i)=diag(Hstd(i,:))*Rt(:,:,i)*diag(Hstd(i,:));
+    %stdresid(i,:)=data(i,:)*Ht(:,:,i)^(-0.5);
+end
+save tempHt Ht
+clear Ht
+
+
+if nargout >=7
+    % How are we going to get STD errors?  Partitioned invers probably.  Well, we need to get the scores form the dcc model, the joint likelihood.
+    % We then need to get A12 and A22 so we can have it all.  We also need to get A11 in the correct form.
+    A=zeros(length(parameters),length(parameters));
+    index=1;
+    for i=1:k
+        workingsize=size(univariate{i}.stderrors);
+        A(index:index+workingsize-1,index:index+workingsize-1)=univariate{i}.stderrors^(-1); %d閎ut de la construction de la matrice A
+        index=index+workingsize;
+    end
+   
+    % Ok so much for a A11 and A12 and A22, as we have them all between whats above
+%    fprintf(1,'\n\nCalculating Standard Errors, this can take a while\n');
+    otherA=dcc_hessian('dcc_mvgarch_full_likelihood',parameters, dccQ + dccP, data, archQ, garchP, dccQ, dccP); %calcul la matrice hessienne pour le DCC
+    A(length(parameters) - dccQ - dccP + 1:length(parameters),:)=otherA; %met la matrice A en bas ?droite de la matrice A existante
+    
+    % We now need to get the scores for the DCC estimator so we can finish B
+    jointscores=zeros(t,length(parameters));
+    index=1;
+    for i=1:k
+        workingsize=size(univariate{i}.scores,2);
+        jointscores(:,index:index+workingsize-1)=univariate{i}.scores;
+        index=index+workingsize;
+    end
+    
+    % Now all we need to do is calculate the scores form the dcc estimator and we have everything
+    h=max(abs(parameters/2),1e-2)*eps^(1/3);
+    hplus=parameters+h;
+    hminus=parameters-h;
+    likelihoodsplus=zeros(t,length(parameters));
+    likelihoodsminus=zeros(t,length(parameters));
+    for i=length(parameters)-dccQ-dccP+1:length(parameters)
+        hparameters=parameters;
+        hparameters(i)=hplus(i);
+        [HOLDER, HOLDER1, indivlike] = dcc_mvgarch_full_likelihood(hparameters, data, archQ, garchP, dccQ, dccP);
+        likelihoodsplus(:,i)=indivlike;
+    end
+    for i=length(parameters)-dccQ-dccP+1:length(parameters)
+        hparameters=parameters;
+        hparameters(i)=hminus(i);
+        [HOLDER, HOLDER1, indivlike] = dcc_mvgarch_full_likelihood(hparameters, data, archQ, garchP, dccQ, dccP);
+        likelihoodsminus(:,i)=indivlike;
+    end
+    DCCscores=(likelihoodsplus(:,length(parameters)-dccQ-dccP+1:length(parameters))-likelihoodsminus(:,length(parameters)-dccQ-dccP+1:length(parameters)))...
+        ./(2*repmat(h(length(parameters)-dccQ-dccP+1:length(parameters))',t,1));
+    jointscores(:,length(parameters)-dccQ-dccP+1:length(parameters))=DCCscores;
+    B=cov(jointscores);
+    A=A/t;
+    stderrors=A^(-1)*B*A'^(-1)*t^(-1);
+end
+% Done!
+load tempHt
+
+***** dcc_mvgarch_full_likelihood.m *****
+% PURPOSE:
+%        Full likelihood for use in the DCC_MVGARCH estimation and
+%        returns the likelihood of the QMLE estimates of the DCC parameters
+% 
+% USAGE:
+%        [logL, Rt, likelihoods, Qt, Zt]=dcc_mvgarch_full_likelihood(parameters, data, archQ, garchP, dccQ, dccP)
+% 
+% INPUTS:
+%    parameters  = A k+sum(archQ)+sum(garchP)+dccQ+dccP vector of parameters of the form
+%                  [GarchParams(1) GarchParams(2) ... GarchParams(k) DCCParams]
+%                  where the garch parameters from each estimation are of the form
+%                  [omega(i) alpha(i1) alpha(i2) ... alpha(ip(i)) beta(i1) beta(i2) ... beta(iq(i))]
+%                  and DCCparams are [DCCa DCCb]
+%    data        = A t by k matrix of zero mean residuals
+%    archQ       = A vector of arch innovation lag lengths
+%    garchP      = A vector of Garch AR lag lengths
+%    dccQ        = A scalar of the DCC innovations lag length
+%    dccP        = A scalar of the DCC AR lag lengths
+% 
+% OUTPUTS:
+%    logL        = The estimated log likelihood
+%    Rt          = The estimates covariances
+%    likelihoods = The likelihoods (t by 1)
+%    Qt          = A k by k by t array of Qt elements
+% 
+% COMMENTS: pour que les estimateurs soient fully efficient
+%  
+% Modifications: Sylvain Benoit    Date Revision: 17/09/2014
+% Initial codes Author: Kevin Sheppard
+% 更多数据请关注公众号【众鲤数据网】官网https://zldatas.com
+
+
+function [logL, Rt, likelihoods, Qt]=dcc_mvgarch_full_likelihood(parameters, data, archQ,garchP,dccQ,dccP)
+
+% First we need to make the T by K matrix of variances.
+[t,k]=size(data);
+H=zeros(size(data));            %initialisation de Ht avec que des 0 [T by 1];
+
+index=1;
+
+for i=1:k
+    
+    alpha = parameters(index:index+archQ(i)-1);
+    gamma = parameters(index+archQ(i):index+archQ(i)+archQ(i)-1);
+    beta  = parameters(index+archQ(i)+archQ(i):index+archQ(i)+archQ(i)+garchP(i)-1);
+                      
+    m = max(archQ(i),garchP(i));         
+
+    h=zeros(size(data,1),1);                   %initialisation de Ht avec que des 0 [T by 1];
+    h(1:m,1)=std(data(:,i))^2;                 %initialisation des m premi鑢es valeurs par la variance non conditionnel;
+    
+%閏riture de ma variance conditionnelle
+
+for T = (1 + m):t
+
+    datalag = data(T-archQ(i):T-1,i);
+    
+    h(T,1) = (1-(sum(alpha)+0.5*sum(gamma)+sum(beta)))*var(data(:,1)) + (datalag.*datalag)'*alpha + (datalag.*datalag.*(datalag<0))'*gamma + h(T-garchP(i):T-1,1)'*beta; %si erreur ici penser au flip left right
+
+end;
+     
+    H(:,i)=h;
+    
+    index=index+archQ(i)+archQ(i)+garchP(i); 
+        
+end
+
+stdresid=data./sqrt(H);
+
+%First compute Qbar, the unconditional Correlation Matrix
+
+Qbar=cov(stdresid);
+
+stdresid=[ones(max(dccQ,dccP),k);stdresid]; %on rajoute
+
+a=parameters(index:index+dccQ-1);
+b=parameters(index+dccQ:index+dccQ+dccP-1);
+sumA=sum(a);
+sumB=sum(b);
+
+% Next compute Qt
+m=max(dccQ,dccP);
+
+Qt=zeros(k,k,t+m);
+Qt(:,:,1:m)=repmat(Qbar,[1 1 m]);
+Rt=zeros(k,k,t+m);
+Rt(:,:,1:m)=repmat(Qbar,[1 1 m]);
+
+logL=0;
+likelihoods=zeros(t+m,1);
+H=[zeros(m,k);H];
+Q=dccQ;
+P=dccP;
+
+for j=(m+1):t+m
+      Qt(:,:,j)=Qbar*(1-sumA-sumB);
+   for i=1:Q
+      Qt(:,:,j)=Qt(:,:,j) + a(i)*(stdresid(j-i,:)'*stdresid(j-i,:));
+   end
+   for i=1:P
+      Qt(:,:,j)=Qt(:,:,j) + b(i)*Qt(:,:,j-i);
+   end
+   Rt(:,:,j)=Qt(:,:,j)./(sqrt(diag(Qt(:,:,j)))*sqrt(diag(Qt(:,:,j)))');
+   likelihoods(j) = k*log(2*pi) + sum(log(H(j,:))) + log(det(Rt(:,:,j))) + stdresid(j,:)*inv(Rt(:,:,j))*stdresid(j,:)'; %vraisemblance compl鑤e!
+   logL=logL + likelihoods(j);
+end;
+
+Qt=Qt(:,:,(m+1:t+m));           %output de Qt matrix [k by k by t]
+Rt=Rt(:,:,(m+1:t+m));
+logL=(1/2)*logL;
+likelihoods=(1/2)*likelihoods(m+1:t+m);
+
+***** dcc_mvgarch_likelihood.m *****
+% PURPOSE:
+%        Restricted likelihood for use in the DCC_MVGARCH estimation and
+%        returns the likelihood of the 2SQMLE estimates of the DCC parameters
+% 
+% USAGE:
+%        [logL, Rt, likelihoods]=dcc_mvgarch_likelihood(params, stdresid, P, Q)
+% 
+% INPUTS:
+%    params      = A Q+P by 1 vector of parameters of the form [dccPparameters;dccQparameters]
+%    stdresid    = A matrix, t x k of residuals standardized by their conditional standard deviation
+%    Q           = The innovation order of the DCC Garch process
+%    P           = The AR order of the DCC estimator
+% 
+% OUTPUTS:
+%    logL        = The calculate Quasi-Likelihood
+%    Rt          = a k x k x t a 3 dimensional array of conditional correlations
+%    likelihoods = a t by 1 vector of quasi likelihoods
+%    Qt          = a k x k x t a 3 dimensional array of conditional correlations on stdresid
+% 
+% 
+% COMMENTS:
+% 
+% Modifications: Sylvain Benoit    Date Revision: 17/09/2014
+% Initial codes Author: Kevin Sheppard
+% kevin.sheppard@economics.ox.ac.uk
+% Revision: 3    Date: 4/1/2004
+
+function [logL, Rt, likelihoods, Qt]=dcc_mvgarch_likelihood(params, stdresid, Q, P)
+
+[t,k]=size(stdresid);   %t renvoie le nb de lignes de stdresid et k le nb de colonnes;
+a=params(1:Q);          %r閏up鑢e l'initialisation de la composante DCC_ARCH;
+b=params(Q+1:Q+P);      %r閏up鑢e l'initialisation de la composante DCC_GARCH;
+sumA=sum(a);            %il fait la somme pour ne pas estimer le alpha0 de l'閝ua du DCC;
+sumB=sum(b);            %il fait la somme pour ne pas estimer le alpha0 de l'閝ua du DCC;
+
+% First compute Qbar, the Unconditional Correlation Matrix
+Qbar=cov(stdresid);
+
+% Next compute Qt
+m=max(Q,P);                             %r閏up鑢e le nb de retard maximum pour avoir exactement t observations
+
+Qt=zeros(k,k,t+m);                      %initialisation de Qt avec que des 0 [k by k by t+m];
+Rt=zeros(k,k,t+m);                      %initialisation de Rt avec que des 0 [k by k by t+m];
+Qt(:,:,1:m)=repmat(Qbar,[1 1 m]);       %seulement la premi鑢e matrice de Qt qui est initialiser par Qbar
+Rt(:,:,1:m)=repmat(Qbar,[1 1 m]);       %seulement la premi鑢e matrice de Rt qui est initialiser par Qbar
+
+logL=0;                                 %initialisation de la logL ?0
+likelihoods=zeros(1,t+m);               %initialisation des t+m lignes de likelihoods ?0
+
+%The stdresid have expected value 1 maybe but in the variances
+stdresid=[zeros(m,k);stdresid];         %avec le ; 鏰 nous donne une concat閚ation verticale des deux matrices, sans le ; ce serait une concat閚ation horizontale;
+
+for j=(m+1):t+m
+     Qt(:,:,j)=Qbar*(1-sumA-sumB);   
+   for i=1:Q
+     Qt(:,:,j)=Qt(:,:,j) + a(i)*(stdresid(j-i,:)'*stdresid(j-i,:));
+   end
+   for i=1:P
+     Qt(:,:,j)=Qt(:,:,j) + b(i)*Qt(:,:,j-i);
+   end
+     Rt(:,:,j)=Qt(:,:,j)./(sqrt(diag(Qt(:,:,j)))*sqrt(diag(Qt(:,:,j)))'); %pourquoi le prime? ne sert ?pas grand chose!;
+     likelihoods(j)=log(det(Rt(:,:,j))) + stdresid(j,:)*inv(Rt(:,:,j))*stdresid(j,:)'; %calcul de la vraisemblance sur chaque observation du N-閏hantillons, c'est que la vraismeblance du DCC
+     logL=logL + likelihoods(j);            %somme au fur et ?mesure pour avoir la log-vraisemblance;
+end;
+
+Qt=Qt(:,:,(m+1:t+m));                   %output de Qt matrix [k by k by t]
+Rt=Rt(:,:,(m+1:t+m));                   %output de Rt matrix [k by k by t]
+logL=(1/2)*logL;                        %c'est 鏰 l'objectif, c'est ce que l'on veut minimiser, Attention, on cherche le minimun car Max(LL)=Min(-LL)!!!
+likelihoods=(1/2)*likelihoods(m+1:t+m); %on calcule la vrai forme r閐uite avec le 1/2
+
+***** fct_MES.m *****
+%PURPOSE, compute MES
+%INPUT :    data    = A t by 2 return with zero mean matrix
+%           c       = A scalar which determine the cut
+%           ht_m    = A t by 1 market conditional volatility matrix
+%           ht_i    = A t by 1 asset conditional volatility matrix
+%           rho     = A t by 1 correlation conditional volatility matrix
+%                       between maket and asset
+%
+%OUTPUT :   MES = A t by 1 conditional MES matrix
+%
+% Author: Sylvain Benoit, Christophe Hurlin,    Date Revision: 17/09/2014
+
+function [MES] = fct_MES(data,c,ht_m,ht_i,rho)
+
+    em=(data(:,1))./ht_m; %market first column
+
+    xi=((data(:,2)./ht_i)-rho.*em)./ sqrt(1-rho.^2); %asset second column
+
+    bwd=1*(size(data,1)^(-0.2)); %Scaillet's bwd p21, I put 1 instead of the standard deviation because our shocks are iid with unit variance
+
+    K1=sum(em.*(normcdf(((c./ht_m)-em)./bwd)))./(sum(normcdf(((c./ht_m)-em)./bwd)));
+
+    K2=sum(xi.*(normcdf(((c./ht_m)-em)./bwd)))./(sum(normcdf(((c./ht_m)-em)./bwd)));
+
+MES = (ht_i.*rho.*K1) + (ht_i.*sqrt(1-rho.^2).*K2);
+
+***** GJRgarch.m *****
+% PURPOSE:
+%     GJR-garch(P,Q) parameter estimation with the Normal Error Distribution
+% 
+% USAGE:
+%     [parameters, likelihood, stderrors, robustSE, ht, scores] = fattailed_garch(data , q , p , startingvals, options)
+% 
+% INPUTS:
+%     data          = A single column of zero mean random data, normal or not for quasi likelihood
+%     Q             = Non-negative, scalar integer representing a model order of the ARCH process
+%     P             = Positive, scalar integer representing a model order of the GARCH process: P is the number of lags of the lagged conditional 
+%                           variances included, Can be empty([]) for ARCH process
+%     startingvals	= A (1+q+q+p) (plus 1 if STUDENTST or GED is selected for the nu parameter) vector of starting vals or [] => default
+%     options       = Default options are use, otherwise you can provide an options vector.  See HELP OPTIMSET
+% 
+% OUTPUTS:
+%     parameters    = a [1+q+q+p X 1] column of parameters with omega, alpha1, alpha2, ..., alpha(p), beta1, beta2, ... beta(q)
+%     likelihood    = the loglikelihood evaluated at he parameters
+%     robustSE      = QuasiLikelihood std errors which are robust to some forms of misspecification(see White 94)
+%     stderrors     = the inverse analytical hessian, not for quasi maximum liklihood
+%     ht            = the estimated time varying VARIANCES
+%     scores        = The numberical scores(# fo params by t) for M testing   
+% 
+% 
+% COMMENTS:
+%   GJR-GARCH(P,Q) constraints
+%     (1) Omega > 0
+%     (2) Alpha(i) >= 0 for i = 1,2,...Q
+%     (3) Gamma(i) >= 0 for i = 1,2,...Q    
+%     (4) Beta(j)  >= 0 for j = 1,2,...P
+%     (5) sum(Alpha(i) + 0.5*Gamma(i) + Beta(j)) < 1 for i = 1,2,...Q and j = 1,2,...P
+%
+%   The time-conditional variance, H(t), of a GJR-GARCH(P,Q) process is modeled as follows:
+%
+%     H(t) = Omega + Alpha(1)*r_{t-1}^2 + Alpha(2)*r_{t-2}^2 +...+ Alpha(Q)*r_{t-q}^2+...
+%                   + Gamma(1)*(r_{t-1}^2)*I-_{t-1} + Gamma(2)*(r_{t-2}^2)*I-_{t-2} +...+ Gamma(Q)*(r_{t-q}^2)*I-_{t-q}+...
+%                      Beta(1)*H(t-1)+ Beta(2)*H(t-2)+...+ Beta(0)*H(t-p)
+%
+% Modifications: Sylvain Benoit    Date Revision: 17/09/2014
+% Initial codes Author: Kevin Sheppard
+% kevin.sheppard@economics.ox.ac.uk
+% Revision: 3    Date: 4/1/2004
+
+function [parameters, likelihood, stderrors, robustSE, ht, scores] = GJRgarch(data , q , p , startingvals, options)
+
+t = size(data,1);
+
+m = max(p,q);   
+
+if isempty(startingvals)
+   alpha  =  0.05*ones(q,1)/q;                  %l'initialisation pourrait 阾re plus propre!!
+   gamma  =  0.05*ones(q,1)/q;
+   beta   =  0.75*ones(p,1)/p;
+else
+    alpha=startingvals(1:q);
+    gamma=startingvals(q+1:2*q);
+    beta=startingvals(2*q+1:2*q+p);
+end
+                        
+LB = zeros(1,q+q+p)+2*options.TolCon;     
+UB = [];     
+sumA =  [-eye(q+q+p) ; ones(1,q) 0.5*ones(1,q) ones(1,p)]; %constraint sumA*X <= sumB
+sumB =  [zeros(q+q+p,1)+ 2*options.TolCon ; 1 - 2*options.TolCon];
+
+startingvals = [alpha ; gamma ; beta];
+
+% Estimate the parameters
+stdEstimate = std(data,1);                      %calcul de la standard deviation
+data        = [stdEstimate(ones(m,1)) ; data];  %initialisation des m premiers 閘閙ents
+T           = size(data,1);
+
+[parameters, LLF, EXITFLAG, OUTPUT, LAMBDA, GRAD] =  fmincon('GJRgarchlikelihood', startingvals ,sumA  , sumB ,[] , [] , LB , UB, [], options, data, q , p, stdEstimate, T);
+
+hess = hessian_2sided('GJRgarchlikelihood',parameters,data,q,p,stdEstimate,T);
+
+[likelihood, ht] = GJRgarchlikelihood(parameters,data,q,p,stdEstimate,T);
+likelihood = - likelihood;
+
+stderrors = inv(hess);                          %ou hess^(-1)
+
+%% Compute robust STD by finite difference
+
+if nargout > 5
+   h=max(abs(parameters/2),1e-2)*eps^(1/3);
+   hplus=parameters+h;
+   hminus=parameters-h;
+   likelihoodsplus=zeros(t,length(parameters));
+   likelihoodsminus=zeros(t,length(parameters));
+   for i=1:length(parameters)
+      hparameters=parameters;
+      hparameters(i)=hplus(i);
+      [HOLDER, HOLDER1, indivlike] = GJRgarchlikelihood(hparameters, data, p, q, stdEstimate, T);
+      likelihoodsplus(:,i)=indivlike;
+   end
+   for i=1:length(parameters)
+      hparameters=parameters;
+      hparameters(i)=hminus(i);
+      [HOLDER, HOLDER1, indivlike] = GJRgarchlikelihood(hparameters, data, p, q, stdEstimate, T);
+      likelihoodsminus(:,i)=indivlike;
+   end
+   scores=(likelihoodsplus-likelihoodsminus)./(2*repmat(h',t,1));
+   scores=scores-repmat(mean(scores),t,1);
+   B=scores'*scores;
+   robustSE=stderrors*B*stderrors;
+end
+
+***** GJRgarchlikelihood.m *****
+% PURPOSE:
+%     Likelihood for GJR-garch estimation
+% 
+% USAGE:
+%     [LLF, h, likelihoods] = GJRgarchlikelihood(parameters , data , q , p, stdEstimate, T)
+% 
+% INPUTS:
+%     parameters	=  A vector of GARCH process params + (error param) of the form [constant, arch, gamma, garch]
+%     data          =  A set of zero mean residuals
+%     q             =  The lag order length for ARCH
+%     p             =  The lag order length for GARCH
+%     stdEstimate	=  The conditional std deviation of the data
+%     T             =  Length of data
+% 
+% OUTPUTS:
+%     LLF           =  Minus 1 times the log likelihood
+%     h             =  Time series of conditional volatilities
+%     likelihoods   =  Time series of likelihoods
+% 
+% COMMENTS:
+%
+% Author: Sylvain Benoit    Date Revision: 17/09/2014
+% Inspiration from: Kevin Sheppard 
+
+function [LLF, h, likelihoods] = GJRgarchlikelihood(parameters , data , q , p, stdEstimate, T)
+
+alpha=parameters(1:q);            %r閏up鑢e l'initialisation de la composante ARCH;
+gamma=parameters(q+1:2*q);        %r閏up鑢e l'initialisation de la composante ARCH quand Epsilont < 0;
+beta=parameters(2*q+1:2*q+p);     %r閏up鑢e l'initialisation de la composante GARCH;
+ 
+m = max(p,q);                       %r閏up鑢e le nb de retard maximum
+
+h=zeros(size(data));                %initialisation de Ht avec que des 0 [T by 1];
+
+h(1:m,1)=stdEstimate^2;             %initialisation des m premi鑢es valeurs par la variance non conditionnel;
+
+for t = (1 + m):T
+
+    datalag = data(t-q:t-1);
+    
+    h(t) = (1-(sum(alpha)+0.5*sum(gamma)+sum(beta)))*var(data) + (datalag.*datalag)'*alpha + (datalag.*datalag.*(datalag<0))'*gamma + h(t-p:t-1)'*beta; %si erreur ici penser au flip left right
+
+end;
+
+t = (1 + m):T;
+
+LLF  =  sum(log(h(t))) + sum((data(t).^2)./h(t));
+LLF  =  0.5 * (LLF  +  (T - m)*log(2*pi));
+
+if nargout > 2
+    likelihoods = 0.5 * ((log(h(t))) + ((data(t).^2)./h(t)) + log(2*pi));
+    likelihoods = -likelihoods;    
+end
+
+h=h(t);
+
+end
+
+***** hessian_2sided.m *****
+% PURPOSE: 
+%      Computes 2-sided finite difference Hessian
+%
+% USAGE:  
+%      H = hessian_2sided(func,x,varargin)
+%
+% INPUTS:
+%      func         = function name, fval = func(x,varargin)
+%      x            = vector of parameters (n x 1)
+%      varargin     = optional arguments passed to the function
+%
+% OUTPUTS:
+%      H            = finite differnce, 2-sided hessian
+%
+% COMMENTS:
+%      Code originally from COMPECON toolbox [www4.ncsu.edu/~pfackler]
+%      documentation modified to fit the format of the Ecoometrics Toolbox
+%      by James P. LeSage, Dept of Economics
+%      University of Toledo
+%      2801 W. Bancroft St,
+%      Toledo, OH 43606
+%      jlesage@spatial-econometrics.com
+%
+% Further modified (to do 2-sided numerical derivs, rather than 1) by:
+% Author: Kevin Sheppard
+% kevin.sheppard@economics.ox.ac.uk
+% Revision: 3    Date: 4/1/2004
+
+function H = hessian_2sided(f,x,varargin)
+
+try
+    feval(f,x,varargin{:});
+catch
+    error('There was an error evaluating the function.  Please check the arguements.');
+end
+
+n = size(x,1);
+fx = feval(f,x,varargin{:});
+
+% Compute the stepsize (h)
+h = eps.^(1/3)*max(abs(x),1e-2);
+xh = x+h;
+h = xh-x;    
+ee = sparse(1:n,1:n,h,n,n);
+
+% Compute forward and backward steps
+gp = zeros(n,1);                                                            %forward
+for i=1:n
+    gp(i) = feval(f,x+ee(:,i),varargin{:});                                 %
+end
+gm = zeros(n,1);                                                            %backward
+for i=1:n
+    gm(i) = feval(f,x-ee(:,i),varargin{:});                                 %
+end
+
+H=h*h';
+Hm=H;
+Hp=H;
+% Compute "double" forward and backward steps
+for i=1:n
+    for j=i:n
+        Hp(i,j) = feval(f,x+ee(:,i)+ee(:,j),varargin{:});
+        Hp(j,i)=Hp(i,j);
+        Hm(i,j) = feval(f,x-ee(:,i)-ee(:,j),varargin{:});
+        Hm(j,i)=Hm(i,j);        
+    end
+end
+
+%Compute the hessian
+for i=1:n
+    for j=i:n
+        H(i,j) = (Hp(i,j)-gp(i)-gp(j)+fx+fx-gm(i)-gm(j)+Hm(i,j))/H(i,j)/2;
+        H(j,i) = H(i,j);
+    end
+end
+
+
+***** main_script.m *****
+% PURPOSE: Main Script
+%       Run DCC with GJR Garch estimation (Maximum Likelihood in 2 step) and compute:
+%           - MES, Delta CoVaR dcc, Delta CoVaR quantile and Delta CoVaR ols
+% 
+% USERS INPUTS:
+%       index   = A t by 1 vector with index returns
+%       asset   = A t by 1 vector with firm's equity returns
+%       LTQ     = A t by 1 vector with the total amount of liabilities of the firm
+%       MV      = A t by 1 vector with the market capitalisation of the firm
+%       alpha   = A scalar between [0,1], risk level of our VaR
+%       k       = A scalar between [0,1], Prudential Capital Required (k*LTQ), usually sets at 4% or 8%
+%
+% TREATMENT:
+%       data_center     = A zero mean t by 2 matrix of returns, per convention the first column is the market returns and the second is the asset
+%
+% GJR-GARCH and DCC:
+%       dcc_mvgarch: call function to estimate DCC-GJRGARCH 
+%   USERS OUTPUTS:
+%       ht_i            = A t by 1 Asset conditional volatility matrix
+%       ht_m            = A t by 1 Market conditional volatility matrix
+%       rho             = A t by 1 conditional correlation matrix
+%       Asset_VaR       = A t by 1 Asset_VaR matrix with empirical quantile at alpha
+%       Market_VaR      = A t by 1 Market_VaR matrix with empirical quantile at alpha
+%       beta            = A t by 1 conditional beta matrix
+%       loglikelihood   = The log likelihood evaluated at the optimum
+%       parameters      = A vector of parameters estimated for our data of the form
+%                          [GarchParams(market) GarchParams(asset) DCCParams]
+%                               where the garch parameters from each estimation are of the form
+%                          [omega(i) alpha(i1) beta(i1))]
+%       recap_stderror  = A vector of standard errors for each parameters
+%       recap_t_stat    = A vector of T-Statistic for each parameters
+%
+% MES:
+%       fct_MES: call function to estimate MES 
+%       c             = A scalar which is used to define the systemic risk event, Market HS VaR here 
+%                           it's a constant(-2% in MES paper) dividing by market conditional standard deviation
+%   USERS OUTPUTS:
+%       MES           = A t by 1 MES matrix
+%
+% SRISK:
+%   USERS OUTPUTS:
+%       LRMES         = A t by 1 LRMES (without simulation) matrix
+%       SRISK         = A t by 1 SRISK matrix
+%
+% CoVaR:
+%   USERS OUTPUTS:
+%       Delta_CoVaR_dcc     = A t by 1 Delta CoVaR dcc matrix
+%       CoVaR_quant         = A t by 1 CoVaR quantile matrix
+%       Delta_CoVaR_quant   = A t by 1 Delta CoVaR quantile matrix
+%       Delta_CoVaR_ols     = A t by 1 Delta CoVaR ols matrix
+%       gam_quant           = Slope parameter estimated by Quantile regression
+%       gam_ols             = Slope parameter estimated by OLS
+%
+% Author: Sylvain Benoit,    Date Revision: 29/09/2015
+
+clear all
+warning off all
+clc
+close all
+
+[data]=xlsread('Data_RMC.xls');
+
+index = data(:,1);            % Returns of the market (system)
+
+asset = data(:,2);            % Returns of the firm's equity
+
+LTQ = data(:,3);              % Total amount of liabilities
+
+MV = data(:,4);               % Market Capitalisation
+
+alpha = 0.05;                 % Risk level of our VaR
+
+k = 0.08;                     % Prudential Capital Required (k*LTQ)
+
+res = call_fct(index,asset,LTQ,MV,k,alpha);
+
+
+***** quantilereg.m *****
+%PURPOSE, compute Delta CoVaR (= < VaR)
+%INPUT :    Y       = A t by 1 matrix of dependant variable
+%           X       = A t by 1 matrix of independant variable
+%           theta   = the sample quantile [0,1]
+%           Ht      = A k by k by t array of conditional variances covariances
+%           ht_m    = A t by 1 market conditional volatility matrix
+%           rho     = A t by 1 correlation conditional volatility matrix
+%                       between maket and asset
+%
+%OUTPUT :   beta    = Estimated Coefficients
+%           tstats  = T-Students of the coefficients
+%
+% Author: Sylvain Benoit    Date Revision: 17/09/2014
+
+function [beta tstats]=quantilereg(y,x,theta)
+
+ry=length(y);       %number of rows of dependant variable (ry=rx)
+[rx cx]=size(x);    %number of rows and columns of independant variable
+x=[ones(rx,1) x];   %add a constant to the independant variable
+cx=cx+1;            %number of independant variables
+
+% Finding first estimates by solving the system
+
+itrat=0;
+xstar=x;
+diff=1;
+beta=ones(cx,1);
+while itrat<1000 && diff>1e-6
+    itrat=itrat+1;
+    beta0=beta;
+    beta=inv(xstar'*x)*xstar'*y;
+    resid=y-x*beta;
+    resid(abs(resid)<.000001)=.000001;
+    resid(resid<0)=theta*resid(resid<0);
+    resid(resid>0)=(1-theta)*resid(resid>0);
+    resid=abs(resid);
+    z=[];
+for i=1:cx 
+    z0 = x(:,i)./resid;
+    z=[z z0];
+end
+
+xstar=z;
+beta1=beta;
+diff=max(abs(beta1-beta0));
+
+end
+
+e=y-x*beta;
+
+%Estimating variances based on Green 2008(quantile regression)
+
+iqre=iqr(e);
+if theta==0.5
+  h=0.9*std(e)/(ry^0.2);
+else
+  h=0.9*min(std(e),iqre/1.34)/(ry^0.2);
+end
+u=(e/h);
+fhat0=(1/(ry*h))*(sum(exp(-u)./((1+exp(-u)).^2)));
+D(ry,ry)=0;
+DIAGON=diag(D);
+DIAGON(e>0)=(theta/fhat0)^2;
+DIAGON(e<=0)=((1-theta)/fhat0)^2;
+D=diag(DIAGON);
+VCQ=(x'*x)^(-1)*x'*D*x*(x'*x)^(-1);
+
+
+%Standard errors and t-stats
+
+tstats=beta./diag(VCQ).^0.5;
+stderrors=diag(VCQ).^0.5;
+PValues=2*(1-tcdf(abs(tstats),ry-cx));
+
+
+
